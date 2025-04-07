@@ -8,6 +8,9 @@ import xml.etree.ElementTree as ET
 import json
 import shutil
 import hashlib
+import yaml
+import tempfile
+import resource
 from datetime import datetime
 
 DB_NAME = "users.db"
@@ -17,9 +20,11 @@ CONFIG_FILE = "easybox_config.json"
 INSTALLED_APPS_DIR = "installed_apps"
 METADATA_DIR = "app_metadata"
 
+
 def create_dirs():
     os.makedirs(INSTALLED_APPS_DIR, exist_ok=True)
     os.makedirs(METADATA_DIR, exist_ok=True)
+
 
 def create_user_table():
     conn = sqlite3.connect(DB_NAME)
@@ -28,11 +33,13 @@ def create_user_table():
     conn.commit()
     conn.close()
 
+
 def create_easybox_file():
     if not os.path.exists(EASYBOX_FILE):
         root = ET.Element("easybox")
         tree = ET.ElementTree(root)
         tree.write(EASYBOX_FILE)
+
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -40,9 +47,11 @@ def load_config():
             return json.load(f)
     return {}
 
+
 def save_config(config):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=4)
+
 
 def register_user(username, password):
     hashed_password = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
@@ -51,6 +60,7 @@ def register_user(username, password):
     c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_password))
     conn.commit()
     conn.close()
+
 
 def authenticate_user(username, password):
     conn = sqlite3.connect(DB_NAME)
@@ -63,6 +73,7 @@ def authenticate_user(username, password):
         return bcrypt.checkpw(password.encode(), stored_hash.encode())
     return False
 
+
 def parse_easybox_file():
     if not os.path.exists(EASYBOX_FILE):
         return None
@@ -70,20 +81,25 @@ def parse_easybox_file():
     root = tree.getroot()
     return root
 
+
 def calculate_file_hash_bytes(data):
     return hashlib.sha256(data).hexdigest()
+
 
 def calculate_file_hash(file_path):
     with open(file_path, "rb") as f:
         return calculate_file_hash_bytes(f.read())
 
+
 def install_dependencies(dependencies):
     for dep in dependencies.split(","):
         subprocess.run(dep.strip(), shell=True)
 
+
 def download_raw_link(raw_link):
     response = requests.get(raw_link)
     return response.content
+
 
 def is_new_version(app_name, raw_link, app_file_path):
     if os.path.exists(app_file_path):
@@ -91,6 +107,7 @@ def is_new_version(app_name, raw_link, app_file_path):
         local_hash = calculate_file_hash(app_file_path)
         return remote_hash != local_hash
     return True
+
 
 def save_metadata(app_name, hash_value):
     metadata = {
@@ -102,6 +119,7 @@ def save_metadata(app_name, hash_value):
     with open(os.path.join(METADATA_DIR, f"{app_name}.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
+
 def update_run_history(app_name):
     path = os.path.join(METADATA_DIR, f"{app_name}.json")
     if os.path.exists(path):
@@ -111,23 +129,41 @@ def update_run_history(app_name):
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
+
+def run_in_isolation(cmd, cwd):
+    def set_limits():
+        resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+        resource.setrlimit(resource.RLIMIT_AS, (100 * 1024 * 1024, 100 * 1024 * 1024))
+    subprocess.run(cmd, shell=True, cwd=cwd, preexec_fn=set_limits)
+
+
 def containerize_application(name, dependencies, raw_link, start_cmd, install_path, args, dry_run):
-    app_file_path = os.path.join(INSTALLED_APPS_DIR, f"{name}.tar.gz")
+    container_dir = os.path.join(INSTALLED_APPS_DIR, name)
+    versioned_tar = os.path.join(container_dir, f"{name}.tar.gz")
+    os.makedirs(container_dir, exist_ok=True)
+
     if dry_run:
         print(f"[DRY RUN] Would install {name}, dependencies: {dependencies}, from: {raw_link}")
         return
-    if is_new_version(name, raw_link, app_file_path):
+
+    if is_new_version(name, raw_link, versioned_tar):
         install_dependencies(dependencies)
         content = download_raw_link(raw_link)
-        with open(app_file_path, "wb") as f:
+        with open(versioned_tar, "wb") as f:
             f.write(content)
-        shutil.unpack_archive(app_file_path, install_path)
-        version_hash = calculate_file_hash(app_file_path)
+        extract_path = os.path.join(container_dir, "current")
+        if os.path.exists(extract_path):
+            shutil.rmtree(extract_path)
+        os.makedirs(extract_path)
+        shutil.unpack_archive(versioned_tar, extract_path)
+        version_hash = calculate_file_hash(versioned_tar)
         save_metadata(name, version_hash)
+
     full_cmd = f"{start_cmd} {' '.join(args)}" if start_cmd else None
     if full_cmd:
-        subprocess.run(full_cmd, shell=True)
+        run_in_isolation(full_cmd, os.path.join(container_dir, "current"))
         update_run_history(name)
+
 
 def process_easybox_install(name, extra_args, config, dry_run=False):
     root = parse_easybox_file()
@@ -141,13 +177,15 @@ def process_easybox_install(name, extra_args, config, dry_run=False):
             start_cmd = app.find("StartCMD").text if app.find("StartCMD") is not None else None
             containerize_application(name, dependencies, raw_link, start_cmd, install_path, extra_args, dry_run)
 
+
 def rollback_installation(name):
-    app_path = os.path.join(INSTALLED_APPS_DIR, f"{name}.tar.gz")
+    container_dir = os.path.join(INSTALLED_APPS_DIR, name)
     meta_path = os.path.join(METADATA_DIR, f"{name}.json")
-    if os.path.exists(app_path):
-        os.remove(app_path)
+    if os.path.exists(container_dir):
+        shutil.rmtree(container_dir)
     if os.path.exists(meta_path):
         os.remove(meta_path)
+
 
 def list_installed_apps():
     apps = os.listdir(METADATA_DIR)
@@ -156,6 +194,7 @@ def list_installed_apps():
         return
     for app in apps:
         print(f"- {app.replace('.json', '')}")
+
 
 def get_app_info(name):
     path = os.path.join(METADATA_DIR, f"{name}.json")
@@ -166,12 +205,31 @@ def get_app_info(name):
         data = json.load(f)
     print(json.dumps(data, indent=2))
 
+
 def update_app(name, config):
     process_easybox_install(name, [], config, dry_run=False)
+
+
+def process_easybox_compose(file):
+    with open(file) as f:
+        compose_data = yaml.safe_load(f)
+    config = load_config()
+    for app in compose_data.get("applications", []):
+        containerize_application(
+            app['name'],
+            app.get('dependencies', ''),
+            app['raw_link'],
+            app.get('start_cmd', None),
+            config.get("install_path", "./"),
+            app.get('args', []),
+            dry_run=False
+        )
+
 
 def log_to_file(msg):
     with open(LOG_FILE, 'a') as f:
         f.write(f"{datetime.now()}: {msg}\n")
+
 
 def main():
     create_user_table()
@@ -208,8 +266,12 @@ def main():
         get_app_info(params[1])
     elif cmd in ["easybox", "eb"] and params[0] == "update":
         update_app(params[1], config)
+    elif cmd in ["easybox", "eb"] and params[0] == "compose":
+        process_easybox_compose(params[1])
     else:
         print("Unknown command.")
 
+
 if __name__ == "__main__":
     main()
+    
